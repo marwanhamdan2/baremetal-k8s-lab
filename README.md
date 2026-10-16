@@ -6,6 +6,36 @@ fabric — and everything above the hypervisor is **exactly** what you would run
 on real on-prem hardware: kubeadm, containerd, kube-vip, Cilium (eBPF, no
 kube-proxy), Gateway API, cert-manager PKI.
 
+## Why this exists
+
+Most Kubernetes learning happens on managed clouds (EKS/GKE/AKS) or
+single-node toys (kind, minikube), where the hard parts are hidden: no
+load balancer to provide, no VIP for the API server, no storage unless you
+bring it, no registry, no PKI. On-prem you own all of it.
+
+This lab builds the whole stack yourself, end to end, from VMs to an HA
+control plane, networking, storage, registry, observability and a traced
+demo app, with scripts you can read and docs that explain every decision.
+Then you break it on purpose (kill a control plane, partition a node,
+restore etcd, upgrade Kubernetes) and watch it recover. Good for CKA/CKS
+prep, platform/SRE engineers heading to on-prem, or anyone who wants to
+know what a managed cluster does for them.
+
+## Requirements
+
+| | Minimum | Notes |
+|---|---|---|
+| Host OS | **Ubuntu 24.04 LTS** (x86_64, bare metal) | scripts use `apt`; other Debian-based distros may work but aren't tested. **Not macOS/Windows** (needs KVM). A VM host only works with nested virtualization |
+| CPU | **8+ cores / 16 threads** with VT-x or AMD-V enabled | 6 VMs = 18 vCPU, overcommit is fine; check with `egrep -c '(vmx\|svm)' /proc/cpuinfo` |
+| RAM | **48 GiB** (64 GiB comfortable) | VMs take 36 GiB, the host needs the rest |
+| Disk | **100 GiB free, SSD/NVMe** | thin disks: ~15 GiB after bring-up, grows with use (etcd and Longhorn dislike slow disks) |
+| Network | internet access | image pulls, apt, Helm charts; LAN access is optional |
+| Access | a sudo user | only `00-host-setup.sh` needs sudo |
+
+Short on RAM? Shrink `CP_RAM_MB` / `W_RAM_MB` or drop a worker in
+[config/lab.env](config/lab.env) **before** the first `labctl up`. Expect
+to lose some observability/storage headroom.
+
 ```mermaid
 graph TB
     inet((Internet))
