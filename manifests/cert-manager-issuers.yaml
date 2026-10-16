@@ -1,0 +1,38 @@
+# ============================================================================
+# Lab PKI, the standard cert-manager bootstrap chain:
+#   selfsigned issuer -> issues the lab ROOT CA -> CA ClusterIssuer "lab-ca"
+# Every cert in the lab (e.g. the Gateway wildcard) chains to lab-root-ca.
+# The CA cert is exported to .state/lab-ca.crt so clients can trust it.
+# ============================================================================
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: selfsigned-bootstrap
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: lab-root-ca
+  namespace: cert-manager
+spec:
+  isCA: true
+  commonName: k8s-lab-root-ca
+  secretName: lab-root-ca
+  duration: 87600h            # 10 years
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: selfsigned-bootstrap
+    kind: ClusterIssuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: lab-ca
+spec:
+  ca:
+    secretName: lab-root-ca

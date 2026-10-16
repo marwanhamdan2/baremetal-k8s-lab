@@ -1,0 +1,13 @@
+# runtime state, caches, rendered files — never commit
+.cache/
+.state/
+generated/
+backups/
+*.bak
+*.log
+
+# editor / notes tooling
+.obsidian/
+.DS_Store
+.vscode/
+.idea/

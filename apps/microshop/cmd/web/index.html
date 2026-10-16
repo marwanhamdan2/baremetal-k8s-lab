@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>microshop — k8s lab</title>
+<style>
+  :root { --bg:#0f1420; --card:#1a2233; --tx:#e7ecf5; --mut:#8b97ad; --acc:#4da3ff; --ok:#37c978; --err:#ff5d5d; }
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--tx); font:15px/1.5 system-ui,sans-serif; padding:2rem; max-width:960px; margin:auto; }
+  h1 { font-size:1.4rem; margin-bottom:.25rem; }
+  .sub { color:var(--mut); margin-bottom:1.5rem; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(170px,1fr)); gap:.8rem; margin-bottom:1.5rem; }
+  .card { background:var(--card); border-radius:10px; padding:1rem; text-align:center; }
+  .card .e { font-size:2rem; }
+  .card .n { margin:.3rem 0; font-weight:600; }
+  .card .p { color:var(--mut); margin-bottom:.6rem; }
+  button { background:var(--acc); color:#fff; border:0; border-radius:7px; padding:.45rem .9rem; cursor:pointer; font-weight:600; }
+  button.warn { background:var(--err); }
+  table { width:100%; border-collapse:collapse; margin-top:.5rem; }
+  td,th { padding:.35rem .5rem; border-bottom:1px solid #2a3550; text-align:left; font-size:.9rem; }
+  .bar { display:flex; gap:.8rem; align-items:center; flex-wrap:wrap; margin-bottom:1rem; }
+  .trace { font:12px monospace; background:var(--card); padding:.4rem .7rem; border-radius:7px; }
+  .trace b { color:var(--acc); }
+  .hint { color:var(--mut); font-size:.85rem; }
+  #cache { font-size:.8rem; padding:.15rem .5rem; border-radius:6px; background:var(--card); color:var(--mut); }
+</style>
+</head>
+<body>
+<h1>🛒 microshop</h1>
+<p class="sub">browser → gateway (Envoy) → web → api → orders/catalog → Postgres + Redis — every hop traced</p>
+
+<div class="bar">
+  <span id="cache">cache: —</span>
+  <span class="trace">last trace: <b id="tid">—</b></span>
+  <button id="chaos" class="warn" title="place an order with ?fail=1">💥 trigger a failing order</button>
+</div>
+<p class="hint">Copy the trace id into Grafana → Explore → Tempo to see the full waterfall (products calls alternate Redis HIT/MISS on a 30s TTL).</p>
+
+<div id="products" class="grid"></div>
+
+<h1 style="font-size:1.1rem">Recent orders</h1>
+<table><thead><tr><th>#</th><th>item</th><th>qty</th><th>total</th><th>at</th></tr></thead><tbody id="orders"></tbody></table>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const money = (c) => "$" + (c / 100).toFixed(2);
+
+function showTrace(resp) {
+  const t = resp.headers.get("X-Trace-Id");
+  if (t) $("tid").textContent = t;
+  const c = resp.headers.get("X-Cache");
+  if (c) $("cache").textContent = "cache: " + c;
+}
+
+async function loadProducts() {
+  const r = await fetch("/api/products"); showTrace(r);
+  const items = await r.json();
+  $("products").innerHTML = items.map(p => `
+    <div class="card">
+      <div class="e">${p.emoji}</div>
+      <div class="n">${p.name}</div>
+      <div class="p">${money(p.price_cents)}</div>
+      <button onclick="order(${p.id})">Buy</button>
+    </div>`).join("");
+}
+
+async function loadOrders() {
+  const r = await fetch("/api/orders"); showTrace(r);
+  const rows = await r.json() || [];
+  $("orders").innerHTML = rows.map(o =>
+    `<tr><td>${o.id}</td><td>${o.emoji} ${o.name}</td><td>${o.qty}</td><td>${money(o.total_cents)}</td><td>${o.at}</td></tr>`).join("");
+}
+
+async function order(id, fail) {
+  const r = await fetch("/api/orders" + (fail ? "?fail=1" : ""), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ product_id: id || 1, qty: 1 }),
+  });
+  showTrace(r);
+  if (!r.ok) console.warn("order failed (expected with chaos):", r.status);
+  loadOrders();
+}
+
+$("chaos").onclick = () => order(1, true);
+loadProducts(); loadOrders();
+setInterval(loadProducts, 15000);
+</script>
+</body>
+</html>

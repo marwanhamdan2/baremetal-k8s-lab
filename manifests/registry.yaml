@@ -1,0 +1,91 @@
+# ============================================================================
+# Private container registry — core on-prem infrastructure. Serves images to
+# containerd on every node, so it deliberately does NOT go through the shared
+# Gateway (image pulls must not depend on the ingress path): it gets its own
+# LoadBalancer IP (10.20.0.210) and terminates TLS itself with a lab-CA cert
+# whose SANs include both the DNS name and the IP.
+# Nodes trust the lab CA (scripts/92-registry.sh) — exactly how a corporate
+# registry + internal PKI works. Prod upgrade path: Harbor (auth, scanning).
+# ============================================================================
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: registry-tls
+  namespace: infra
+spec:
+  secretName: registry-tls
+  issuerRef:
+    name: lab-ca
+    kind: ClusterIssuer
+  dnsNames: ["registry.k8s.lab"]
+  ipAddresses: ["10.20.0.210"]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: registry-data
+  namespace: infra
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: registry
+  namespace: infra
+  labels: { app: registry }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }        # RWO volume — never two writers
+  selector:
+    matchLabels: { app: registry }
+  template:
+    metadata:
+      labels: { app: registry }
+    spec:
+      containers:
+        - name: registry
+          image: registry:3
+          env:
+            - name: REGISTRY_HTTP_ADDR
+              value: ":5000"
+            - name: REGISTRY_HTTP_TLS_CERTIFICATE
+              value: /certs/tls.crt
+            - name: REGISTRY_HTTP_TLS_KEY
+              value: /certs/tls.key
+            - name: REGISTRY_STORAGE_DELETE_ENABLED
+              value: "true"
+          ports:
+            - containerPort: 5000
+              name: https
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/registry }
+            - { name: certs, mountPath: /certs, readOnly: true }
+          readinessProbe:
+            httpGet: { path: /v2/, port: 5000, scheme: HTTPS }
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: registry-data }
+        - name: certs
+          secret: { secretName: registry-tls }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: registry
+  namespace: infra
+  annotations:
+    lbipam.cilium.io/ips: "10.20.0.210"   # pin the LB IP (within the pool)
+spec:
+  type: LoadBalancer
+  selector: { app: registry }
+  ports:
+    - name: https
+      port: 443
+      targetPort: 5000

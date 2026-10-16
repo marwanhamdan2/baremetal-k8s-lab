@@ -1,0 +1,22 @@
+# ============================================================================
+# Longhorn — real CSI: distributed replicated block storage across the
+# workers (the on-prem k8s storage standard for small/medium clusters).
+# Becomes the DEFAULT StorageClass; every volume gets 2 replicas on
+# different workers, so data survives a node death (drill in docs).
+# ============================================================================
+persistence:
+  defaultClass: true
+  defaultClassReplicaCount: 2
+  reclaimPolicy: Delete
+
+defaultSettings:
+  defaultReplicaCount: 2
+  defaultDataPath: /var/lib/longhorn
+  replicaSoftAntiAffinity: false        # hard-require replicas on distinct nodes
+  storageMinimalAvailablePercentage: 10
+
+longhornUI:
+  replicas: 1
+
+preUpgradeChecker:
+  jobEnabled: false

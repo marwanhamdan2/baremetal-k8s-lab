@@ -1,0 +1,160 @@
+# ============================================================================
+# The four Go services + route. Deployed with ko:
+#   ko resolve -f deploy/apps.yaml | kubectl apply -f -
+# ko builds each `ko://` import path into an image, pushes it to the lab
+# registry, and substitutes the digest reference. All tracing config comes
+# from standard OTEL_* env vars (see internal/obs).
+# ============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: microshop
+  labels: { app: web }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: web }
+  template:
+    metadata:
+      labels: { app: web }
+    spec:
+      containers:
+        - name: web
+          image: ko://k8slab.dev/microshop/cmd/web
+          env:
+            - { name: API_URL, value: "http://api:8080" }
+            - { name: OTEL_SERVICE_NAME, value: "web" }
+            - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://otel-collector.observability.svc:4317" }
+            - { name: OTEL_RESOURCE_ATTRIBUTES, value: "deployment.environment=lab" }
+          ports: [{ containerPort: 8080, name: http }]
+          readinessProbe: { httpGet: { path: /healthz, port: 8080 } }
+          resources: { requests: { cpu: 25m, memory: 32Mi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: microshop }
+spec:
+  selector: { app: web }
+  ports: [{ name: http, port: 8080 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: microshop
+  labels: { app: api }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: api }
+  template:
+    metadata:
+      labels: { app: api }
+    spec:
+      containers:
+        - name: api
+          image: ko://k8slab.dev/microshop/cmd/api
+          env:
+            - { name: CATALOG_URL, value: "http://catalog:8080" }
+            - { name: ORDERS_URL, value: "http://orders:8080" }
+            - { name: OTEL_SERVICE_NAME, value: "api" }
+            - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://otel-collector.observability.svc:4317" }
+            - { name: OTEL_RESOURCE_ATTRIBUTES, value: "deployment.environment=lab" }
+          ports: [{ containerPort: 8080, name: http }]
+          readinessProbe: { httpGet: { path: /healthz, port: 8080 } }
+          resources: { requests: { cpu: 25m, memory: 32Mi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: api, namespace: microshop }
+spec:
+  selector: { app: api }
+  ports: [{ name: http, port: 8080 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: catalog
+  namespace: microshop
+  labels: { app: catalog }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: catalog }
+  template:
+    metadata:
+      labels: { app: catalog }
+    spec:
+      containers:
+        - name: catalog
+          image: ko://k8slab.dev/microshop/cmd/catalog
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef: { name: shop-db-app, key: uri }
+            - { name: REDIS_ADDR, value: "redis:6379" }
+            - { name: OTEL_SERVICE_NAME, value: "catalog" }
+            - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://otel-collector.observability.svc:4317" }
+            - { name: OTEL_RESOURCE_ATTRIBUTES, value: "deployment.environment=lab" }
+          ports: [{ containerPort: 8080, name: http }]
+          readinessProbe: { httpGet: { path: /healthz, port: 8080 } }
+          resources: { requests: { cpu: 25m, memory: 48Mi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: catalog, namespace: microshop }
+spec:
+  selector: { app: catalog }
+  ports: [{ name: http, port: 8080 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders
+  namespace: microshop
+  labels: { app: orders }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: orders }
+  template:
+    metadata:
+      labels: { app: orders }
+    spec:
+      containers:
+        - name: orders
+          image: ko://k8slab.dev/microshop/cmd/orders
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef: { name: shop-db-app, key: uri }
+            - { name: CATALOG_URL, value: "http://catalog:8080" }
+            - { name: OTEL_SERVICE_NAME, value: "orders" }
+            - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://otel-collector.observability.svc:4317" }
+            - { name: OTEL_RESOURCE_ATTRIBUTES, value: "deployment.environment=lab" }
+          ports: [{ containerPort: 8080, name: http }]
+          readinessProbe: { httpGet: { path: /healthz, port: 8080 } }
+          resources: { requests: { cpu: 25m, memory: 48Mi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: orders, namespace: microshop }
+spec:
+  selector: { app: orders }
+  ports: [{ name: http, port: 8080 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: shop
+  namespace: microshop
+spec:
+  parentRefs:
+    - name: lab-gateway
+      namespace: infra
+  hostnames: ["shop.k8s.lab"]
+  rules:
+    - backendRefs:
+        - name: web
+          port: 8080

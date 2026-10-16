@@ -1,0 +1,32 @@
+# ============================================================================
+# Grafana Tempo — distributed tracing backend (monolithic mode, local
+# storage; prod runs the distributed chart over object storage). Ingests
+# OTLP from the OpenTelemetry Collector; TraceQL in Grafana.
+# metrics-generator derives RED metrics + the service graph and remote-writes
+# them into Prometheus (enableRemoteWriteReceiver on the kps side).
+# ============================================================================
+tempo:
+  retention: 48h
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: "0.0.0.0:4317"
+        http:
+          endpoint: "0.0.0.0:4318"
+  metricsGenerator:
+    enabled: true
+    remoteWriteUrl: "http://kps-prometheus.observability.svc:9090/api/v1/write"
+  overrides:
+    defaults:
+      metrics_generator:
+        # local-blocks powers TraceQL metrics = Grafana "Traces Drilldown" panels
+        processors: [service-graphs, span-metrics, local-blocks]
+
+persistence:
+  enabled: true
+  storageClassName: local-path
+  size: 10Gi
+
+serviceMonitor:
+  enabled: true

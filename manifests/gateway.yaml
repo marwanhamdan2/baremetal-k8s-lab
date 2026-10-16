@@ -1,0 +1,42 @@
+# ============================================================================
+# The shared API gateway of the lab (Gateway API, implemented by Cilium's
+# Envoy). One Gateway in the `infra` namespace; app teams attach HTTPRoutes
+# from their own namespaces — the standard "shared gateway" prod pattern.
+#
+# cert-manager's Gateway integration watches the annotation below and issues
+# the wildcard cert for the HTTPS listener from the lab CA.
+# Rendered by scripts/60-addons.sh (var: GATEWAY_IP).
+# ============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: infra
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: lab-gateway
+  namespace: infra
+  annotations:
+    cert-manager.io/cluster-issuer: lab-ca
+spec:
+  gatewayClassName: cilium
+  addresses:                       # pin the LB IP -> host DNAT + DNS use it
+    - type: IPAddress
+      value: "${GATEWAY_IP}"
+  listeners:
+    - name: http
+      port: 80
+      protocol: HTTP
+      allowedRoutes:
+        namespaces: { from: All }
+    - name: https
+      port: 443
+      protocol: HTTPS
+      hostname: "*.k8s.lab"
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: lab-wildcard-tls   # issued by cert-manager via annotation
+      allowedRoutes:
+        namespaces: { from: All }

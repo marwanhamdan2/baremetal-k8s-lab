@@ -1,0 +1,72 @@
+# ============================================================================
+# Demo workload: podinfo — 3 replicas spread across the workers, exposed
+# through the shared Gateway at http(s)://hello.k8s.lab.
+# Great for demos: its UI shows WHICH pod answered, so refreshing shows
+# gateway -> service load-balancing live. (var: PODINFO_VERSION)
+# ============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: podinfo
+  namespace: default
+  labels: { app: podinfo }
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: podinfo }
+  template:
+    metadata:
+      labels: { app: podinfo }
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: podinfo }
+      containers:
+        - name: podinfo
+          image: ghcr.io/stefanprodan/podinfo:${PODINFO_VERSION}
+          # tracing: flag enables the OTel SDK, endpoint comes from the env.
+          # image has CMD-only (no ENTRYPOINT) -> must set command WITH args
+          command: ["./podinfo"]
+          args: ["--otel-service-name=podinfo"]
+          env:
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector.observability.svc:4317"  # gRPC (4318 = HTTP)
+          ports:
+            - containerPort: 9898
+              name: http
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+          readinessProbe:
+            httpGet: { path: /readyz, port: 9898 }
+          livenessProbe:
+            httpGet: { path: /healthz, port: 9898 }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: podinfo
+  namespace: default
+spec:
+  selector: { app: podinfo }
+  ports:
+    - name: http
+      port: 9898
+      targetPort: 9898
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: hello
+  namespace: default
+spec:
+  parentRefs:
+    - name: lab-gateway
+      namespace: infra
+  hostnames: ["hello.k8s.lab"]
+  rules:
+    - backendRefs:
+        - name: podinfo
+          port: 9898

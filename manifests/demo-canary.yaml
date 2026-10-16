@@ -1,0 +1,81 @@
+# ============================================================================
+# Traffic-management exercise: weighted canary via Gateway API (Cilium Envoy).
+# Applies a "canary" podinfo (different UI color/message) and re-weights the
+# hello.k8s.lab route 90/10. Watch the split live:
+#
+#   kubectl apply -f manifests/demo-canary.yaml
+#   for i in $(seq 1 20); do curl -s http://hello.k8s.lab/ | jq -r .hostname; done | sort | uniq -c
+#
+# Promote: shift weights (90/10 -> 50/50 -> 0/100). Rollback: weight 0 or
+# kubectl apply -f generated/demo-podinfo.yaml. Full walkthrough:
+# docs/60-traffic-management.md
+# ============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: podinfo-canary
+  namespace: default
+  labels: { app: podinfo-canary }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: podinfo-canary }
+  template:
+    metadata:
+      labels: { app: podinfo-canary }
+    spec:
+      containers:
+        - name: podinfo
+          image: ghcr.io/stefanprodan/podinfo:6.14.1
+          command: ["./podinfo"]
+          args: ["--otel-service-name=podinfo-canary"]
+          env:
+            - name: PODINFO_UI_COLOR
+              value: "#ffb700"
+            - name: PODINFO_UI_MESSAGE
+              value: "CANARY build"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector.observability.svc:4317"  # gRPC (4318 = HTTP)
+            - name: OTEL_SERVICE_NAME
+              value: "podinfo-canary"
+          ports:
+            - containerPort: 9898
+              name: http
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+          readinessProbe:
+            httpGet: { path: /readyz, port: 9898 }
+          livenessProbe:
+            httpGet: { path: /healthz, port: 9898 }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: podinfo-canary
+  namespace: default
+spec:
+  selector: { app: podinfo-canary }
+  ports:
+    - name: http
+      port: 9898
+      targetPort: 9898
+---
+# same route name as the base app -> this apply REPLACES the routing rule
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: hello
+  namespace: default
+spec:
+  parentRefs:
+    - name: lab-gateway
+      namespace: infra
+  hostnames: ["hello.k8s.lab"]
+  rules:
+    - backendRefs:
+        - name: podinfo
+          port: 9898
+          weight: 90
+        - name: podinfo-canary
+          port: 9898
+          weight: 10

@@ -1,0 +1,2 @@
+# ko build config — distroless static base (nonroot), reproducible Go images
+defaultBaseImage: gcr.io/distroless/static:nonroot

@@ -1,0 +1,16 @@
+# Expose the Hubble UI (network observability) through the shared Gateway:
+# http://hubble.k8s.lab — cross-namespace HTTPRoute, lives next to its Service.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: hubble-ui
+  namespace: kube-system
+spec:
+  parentRefs:
+    - name: lab-gateway
+      namespace: infra
+  hostnames: ["hubble.k8s.lab"]
+  rules:
+    - backendRefs:
+        - name: hubble-ui
+          port: 80

@@ -1,0 +1,56 @@
+# ============================================================================
+# Grafana Loki — log aggregation. SingleBinary mode with filesystem storage:
+# the honest lab shape of what prod runs as SimpleScalable/Distributed over
+# object storage (S3/MinIO). Same LogQL, same schema, same operations.
+# ============================================================================
+deploymentMode: SingleBinary
+
+loki:
+  auth_enabled: false
+  commonConfig:
+    replication_factor: 1
+  storage:
+    type: filesystem
+  schemaConfig:
+    configs:
+      - from: "2024-01-01"
+        store: tsdb
+        object_store: filesystem
+        schema: v13
+        index:
+          prefix: index_
+          period: 24h
+  limits_config:
+    retention_period: 168h          # 7 days
+  compactor:
+    retention_enabled: true
+    delete_request_store: filesystem
+
+singleBinary:
+  replicas: 1
+  persistence:
+    enabled: true
+    storageClass: local-path
+    size: 20Gi
+  resources:
+    requests: { cpu: 100m, memory: 512Mi }
+
+# zero out the scalable-mode components (SingleBinary handles everything)
+read:    { replicas: 0 }
+write:   { replicas: 0 }
+backend: { replicas: 0 }
+
+# keep the footprint lean: no memcached tier, no canary at lab scale
+chunksCache:  { enabled: false }
+resultsCache: { enabled: false }
+lokiCanary:   { enabled: false }
+gateway:      { enabled: false }
+test:         { enabled: false }
+
+monitoring:
+  serviceMonitor:
+    enabled: true
+  selfMonitoring:
+    enabled: false
+    grafanaAgent:
+      installOperator: false

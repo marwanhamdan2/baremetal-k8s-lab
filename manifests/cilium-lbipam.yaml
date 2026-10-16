@@ -1,0 +1,27 @@
+# ============================================================================
+# On-prem LoadBalancer plumbing (applied by scripts/50-cilium.sh, which
+# substitutes __POOL_API__/__L2_API__ with the CRD version the cluster serves
+# and envsubsts the pool range).
+#
+#  CiliumLoadBalancerIPPool  -> which IPs LoadBalancer Services may get
+#  CiliumL2AnnouncementPolicy -> agents answer ARP for those IPs on eth1,
+#                                so anything on 10.20.0.0/24 (incl. the host,
+#                                and the LAN via DNAT/route) can reach them.
+# ============================================================================
+apiVersion: __POOL_API__
+kind: CiliumLoadBalancerIPPool
+metadata:
+  name: lab-pool
+spec:
+  blocks:
+    - start: "${LB_POOL_START}"   # .200 — taken first, by the shared Gateway
+      stop: "${LB_POOL_STOP}"
+---
+apiVersion: __L2_API__
+kind: CiliumL2AnnouncementPolicy
+metadata:
+  name: cluster-l2
+spec:
+  interfaces: ["^eth1$"]          # announce ONLY on the cluster network
+  externalIPs: true
+  loadBalancerIPs: true

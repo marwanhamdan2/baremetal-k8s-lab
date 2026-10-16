@@ -1,0 +1,47 @@
+# ============================================================================
+# OpenTelemetry Collector — the vendor-neutral telemetry front door (the
+# pattern prod uses: apps speak OTLP to the collector; the collector batches,
+# limits memory, and fans out to backends — here: traces -> Tempo).
+# Adding logs/metrics pipelines later is a values change, not an app change.
+# ============================================================================
+mode: deployment
+replicaCount: 1
+fullnameOverride: otel-collector
+
+image:
+  repository: otel/opentelemetry-collector-k8s
+
+config:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+  processors:
+    memory_limiter:
+      check_interval: 1s
+      limit_percentage: 80
+      spike_limit_percentage: 25
+    batch: {}
+  exporters:
+    otlp:
+      endpoint: tempo.observability.svc:4317
+      tls:
+        insecure: true
+  service:
+    pipelines:
+      traces:
+        receivers: [otlp]
+        processors: [memory_limiter, batch]
+        exporters: [otlp]
+
+resources:
+  requests: { cpu: 50m, memory: 128Mi }
+
+ports:
+  jaeger-compact: { enabled: false }
+  jaeger-thrift: { enabled: false }
+  jaeger-grpc: { enabled: false }
+  zipkin: { enabled: false }

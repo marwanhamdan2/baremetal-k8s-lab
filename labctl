@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+# ============================================================================
+# labctl — one CLI to manage the whole lab: VMs, networks, cluster.
+# Run ./labctl help for the command list.
+# ============================================================================
+set -Eeuo pipefail
+LAB_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$LAB_DIR/lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+labctl — Kubernetes on-prem lab control
+
+  BRING-UP
+    up                     run all stages (networks -> VMs -> cluster -> cilium -> addons)
+    doctor                 diagnose host/lab health with hints
+
+  VM & NETWORK LIFECYCLE
+    status                 VMs, nodes, gateway, VIP at a glance
+    start | stop | restart ordered power control (CPs first up, last down)
+    autostart <on|off|status>  start the whole lab with the host at boot
+    ssh <node> [cmd]       SSH into a node (cp1..cp3, w1..w3)
+    console <node>         serial console (exit: Ctrl+])
+    ips                    addressing table (VMs, VIP, LB pool, LAN)
+    sniff <vxlan|arp|api>  live tcpdump on the cluster bridge (sudo)
+
+  SNAPSHOTS & STATE
+    snapshot create <name>   offline snapshot of ALL VMs (stops + restarts lab)
+    snapshot restore <name>  revert ALL VMs to a snapshot
+    snapshot list            list snapshots
+    reset                    restore the "baseline" snapshot
+    etcd-backup              etcd snapshot -> backups/
+
+  CLUSTER HELPERS
+    kubeconfig             print kubeconfig paths + LAN variant
+    approve-certs          approve pending kubelet serving CSRs
+    expose <on|off|status> LAN DNAT rules (sudo)
+
+  DANGER
+    destroy [--yes]        delete all VMs (+ ask about networks); host pkgs stay
+EOF
+}
+
+ordered_up()   { echo "$CP_NODES $WORKER_NODES"; }
+ordered_down() { echo "$WORKER_NODES $CP_NODES"; }
+
+cmd_up() {
+  [[ -x /usr/bin/virsh || -x /usr/sbin/libvirtd || -e /run/libvirt ]] \
+    || die "libvirt missing — run: sudo ./scripts/00-host-setup.sh first"
+  local s
+  for s in 10-networks 20-create-vms 30-prep-nodes 40-init-cluster 50-cilium 60-addons; do
+    log "═══ stage $s ═══"
+    "$LAB_DIR/scripts/$s.sh"
+  done
+  "$LAB_DIR/scripts/70-verify.sh"
+  for s in 80-observability 90-storage 92-registry 94-microshop; do
+    log "═══ stage $s ═══"
+    "$LAB_DIR/scripts/$s.sh"
+  done
+}
+
+cmd_status() {
+  echo "── VMs ─────────────────────────────────────────────"
+  for n in $ALL_NODES; do printf '  %-4s %-8s %s\n' "$n" "$(vm_state "$n")" "$(cluster_ip "$n")"; done
+  echo "── kubernetes ──────────────────────────────────────"
+  if kubectl --request-timeout=4s get nodes >/dev/null 2>&1; then
+    kubectl get nodes -o wide 2>/dev/null | sed 's/^/  /'
+    echo
+    printf '  API VIP:  https://%s:6443 (%s)\n' "$API_VIP" "$API_FQDN"
+    printf '  Gateway:  http://%s  hello.%s | hubble.%s\n' "$GATEWAY_IP" "$LAB_DOMAIN" "$LAB_DOMAIN"
+    local lp; lp="$(lan_ip || true)"
+    [[ -n "$lp" ]] && printf '  LAN:      https://%s:6443 | http://%s | cockpit https://%s:9090\n' "$lp" "$lp" "$lp"
+  else
+    echo "  API not reachable (lab stopped or not yet built)"
+  fi
+}
+
+cmd_start() {
+  for n in $(ordered_up); do
+    [[ "$(vm_state "$n")" == running ]] || { log "starting $n"; vsh start "$(vm_name "$n")" >/dev/null; }
+    is_cp "$n" && sleep 2
+  done
+  log "waiting for API ..."
+  retry 40 5 kubectl --request-timeout=4s get --raw /readyz >/dev/null 2>&1 \
+    && log "cluster is up" || warn "API not up yet — give etcd a minute, check: labctl status"
+}
+
+cmd_stop() {
+  local n vm i
+  for n in $(ordered_down); do
+    vm="$(vm_name "$n")"
+    [[ "$(vm_state "$n")" == running ]] || continue
+    log "shutting down $n"
+    vsh shutdown --mode agent,acpi "$vm" >/dev/null 2>&1 || vsh shutdown "$vm" >/dev/null
+  done
+  for n in $(ordered_down); do
+    vm="$(vm_name "$n")"
+    for i in $(seq 1 30); do [[ "$(vm_state "$n")" != running ]] && break; sleep 3; done
+    [[ "$(vm_state "$n")" == running ]] && { warn "$n did not shut down — forcing"; vsh destroy "$vm" >/dev/null; }
+  done
+  log "lab stopped"
+}
+
+cmd_snapshot() {
+  local action="${1:-list}" name="${2:-}"
+  case "$action" in
+    list) for n in $ALL_NODES; do echo "── $n:"; vsh snapshot-list "$(vm_name "$n")" 2>/dev/null | tail -n +3 | sed 's/^/  /'; done ;;
+    create)
+      [[ -n "$name" ]] || die "usage: labctl snapshot create <name>"
+      local was_running=0; [[ "$(vm_state cp1)" == running ]] && was_running=1
+      cmd_stop
+      local vm dev
+      for n in $ALL_NODES; do
+        vm="$(vm_name "$n")"
+        # seed ISO (raw) can't be part of an internal snapshot — eject it once;
+        # cloud-init already ran and all config is persisted on disk.
+        dev="$(vsh domblklist "$vm" 2>/dev/null | awk '/-seed\.iso/{print $1}')"
+        if [[ -n "$dev" ]]; then
+          vsh change-media "$vm" "$dev" --eject --config >/dev/null 2>&1 || true
+        fi
+        log "snapshotting $n"
+        vsh snapshot-create-as "$vm" "$name" --description "labctl $(date -Is)" >/dev/null
+      done
+      [[ $was_running -eq 1 ]] && cmd_start
+      log "snapshot '$name' created for all VMs" ;;
+    restore)
+      [[ -n "$name" ]] || die "usage: labctl snapshot restore <name>"
+      cmd_stop
+      for n in $ALL_NODES; do log "reverting $n -> $name"; vsh snapshot-revert "$(vm_name "$n")" "$name" >/dev/null; done
+      cmd_start ;;
+    delete)
+      [[ -n "$name" ]] || die "usage: labctl snapshot delete <name>"
+      for n in $ALL_NODES; do vsh snapshot-delete "$(vm_name "$n")" "$name" >/dev/null 2>&1 || true; done ;;
+    *) die "usage: labctl snapshot <create|restore|list|delete> [name]" ;;
+  esac
+}
+
+cmd_autostart() {
+  local n
+  case "${1:-status}" in
+    on)  for n in $ALL_NODES; do vsh autostart "$(vm_name "$n")" >/dev/null; done
+         log "lab starts with the host now (libvirt autostart; API ready ~1-2 min after boot)" ;;
+    off) for n in $ALL_NODES; do vsh autostart --disable "$(vm_name "$n")" >/dev/null; done
+         log "autostart disabled — run ./labctl start after boot" ;;
+    status) for n in $ALL_NODES; do
+              printf '  %-4s autostart=%s\n' "$n" \
+                "$(vsh dominfo "$(vm_name "$n")" | awk -F': *' '/Autostart/{print $2; exit}')"
+            done ;;
+    *) die "usage: labctl autostart <on|off|status>" ;;
+  esac
+}
+
+cmd_etcd_backup() {
+  mkdir -p "$LAB_DIR/backups"
+  local out="backups/etcd-$(date +%Y%m%d-%H%M%S).db"
+  log "taking etcd snapshot via etcd-cp1 ..."
+  kubectl -n kube-system exec etcd-cp1 -- sh -c \
+    "etcdctl --endpoints https://127.0.0.1:2379 \
+      --cacert /etc/kubernetes/pki/etcd/ca.crt \
+      --cert /etc/kubernetes/pki/etcd/server.crt \
+      --key /etc/kubernetes/pki/etcd/server.key \
+      snapshot save /var/lib/etcd/k8slab-backup.db" >/dev/null
+  nssh cp1 "sudo cat /var/lib/etcd/k8slab-backup.db" > "$LAB_DIR/$out"
+  nssh cp1 "sudo rm -f /var/lib/etcd/k8slab-backup.db"
+  log "etcd backup: $out ($(du -h "$LAB_DIR/$out" | cut -f1)) — restore drill: docs/20-operations.md"
+}
+
+cmd_kubeconfig() {
+  echo "local : $HOME/.kube/config  (server: https://$API_FQDN:6443)"
+  local lp; lp="$(lan_ip || true)"
+  if [[ -n "$lp" && -f "$HOME/.kube/config" ]]; then
+    sed "s#server: https://.*#server: https://$lp:6443#" "$HOME/.kube/config" > "$STATE_DIR/kubeconfig-lan.yaml"
+    chmod 600 "$STATE_DIR/kubeconfig-lan.yaml"
+    echo "LAN   : .state/kubeconfig-lan.yaml  (server: https://$lp:6443)"
+    echo "        copy it to another device:  scp $USER@$lp:$STATE_DIR/kubeconfig-lan.yaml ~/.kube/config"
+  fi
+}
+
+cmd_expose() {
+  case "${1:-status}" in
+    on)     sudo systemctl enable --now k8slab-expose.service && log "DNAT rules active (boot-persistent)" ;;
+    off)    sudo systemctl disable --now k8slab-expose.service && log "DNAT rules removed (re-enable: labctl expose on)" ;;
+    status) { nft list table inet k8slab 2>/dev/null || sudo nft list table inet k8slab; } | sed 's/^/  /' ;;
+    *) die "usage: labctl expose <on|off|status>" ;;
+  esac
+}
+
+cmd_sniff() {
+  case "${1:-}" in
+    vxlan) log "VXLAN-encapsulated pod traffic between nodes (Ctrl+C to stop)"
+           sudo tcpdump -ni "$CLUSTER_BR" 'udp port 8472' ;;
+    arp)   log "ARP on the cluster net — watch L2 announcements claim LB IPs"
+           sudo tcpdump -ni "$CLUSTER_BR" arp ;;
+    api)   log "API server traffic to the VIP"
+           sudo tcpdump -ni "$CLUSTER_BR" "tcp port 6443 and host $API_VIP" ;;
+    *) die "usage: labctl sniff <vxlan|arp|api>" ;;
+  esac
+}
+
+cmd_ips() {
+  printf '%-6s %-12s %-12s %-20s %s\n' NODE MGMT CLUSTER "MAC (cluster)" ROLE
+  for n in $ALL_NODES; do
+    printf '%-6s %-12s %-12s %-20s %s\n' "$n" "$(mgmt_ip "$n")" "$(cluster_ip "$n")" "$(mac_cluster "$n")" \
+      "$(is_cp "$n" && echo control-plane || echo worker)"
+  done
+  echo
+  echo "API VIP      : $API_VIP ($API_FQDN)"
+  echo "Gateway LB   : $GATEWAY_IP (hello.$LAB_DOMAIN, hubble.$LAB_DOMAIN)"
+  echo "LB-IPAM pool : $LB_POOL_START - $LB_POOL_STOP"
+  echo "Pod CIDR     : $POD_CIDR   Service CIDR: $SVC_CIDR"
+  echo "Host bridges : $MGMT_GW ($MGMT_BR), $CLUSTER_HOST_IP ($CLUSTER_BR)"
+  echo "LAN          : $(lan_ip || echo '?') on $(lan_iface || echo '?')"
+}
+
+cmd_doctor() {
+  local ok=0 bad=0
+  d() { if eval "$2" >/dev/null 2>&1; then printf '  \e[32m✔\e[0m %s\n' "$1"; ok=$((ok+1)); else printf '  \e[31m✘\e[0m %s  \e[33m-> %s\e[0m\n' "$1" "$3"; bad=$((bad+1)); fi; }
+  d "/dev/kvm exists"            "test -e /dev/kvm"                       "enable VT-x in BIOS"
+  d "libvirtd running"           "systemctl is-active libvirtd"           "sudo ./scripts/00-host-setup.sh"
+  d "user in libvirt group"      "getent group libvirt | grep -qw $USER"  "sudo ./scripts/00-host-setup.sh, then re-login"
+  d "kubectl installed"          "command -v kubectl"                     "sudo ./scripts/00-host-setup.sh"
+  d "mgmt network active"        "net_active $MGMT_NET"    "./scripts/10-networks.sh"
+  d "cluster network active"     "net_active $CLUSTER_NET" "./scripts/10-networks.sh"
+  d "6 VMs defined"              "[[ \$(vsh list --all --name | grep -c '^$VM_PREFIX-') -eq 6 ]]" "./scripts/20-create-vms.sh"
+  d "cp1 SSH reachable"          "nssh cp1 true"                          "labctl start / labctl console cp1"
+  d "API via VIP"                "kubectl --request-timeout=4s get --raw /readyz" "labctl start; docs/40-troubleshooting.md"
+  d "all nodes Ready"            "[[ \$(kubectl get nodes --no-headers 2>/dev/null | grep -cw Ready) -eq 6 ]]" "kubectl get nodes; docs/40-troubleshooting.md"
+  d "cilium healthy"             "[[ \$(kubectl -n kube-system get ds cilium -o jsonpath='{.status.numberReady}' 2>/dev/null) -eq 6 ]]" "cilium status"
+  d "gateway programmed"         "kubectl -n infra get gateway lab-gateway -o jsonpath='{.status.conditions[?(@.type==\"Programmed\")].status}' | grep -q True" "./scripts/60-addons.sh"
+  echo; log "doctor: $ok ok, $bad problems"
+}
+
+cmd_destroy() {
+  local yes="${1:-}"
+  if [[ "$yes" != "--yes" ]]; then
+    read -rp "Delete ALL 6 lab VMs and their disks? (networks asked next) [type 'destroy']: " a
+    [[ "$a" == destroy ]] || die "aborted"
+  fi
+  for n in $ALL_NODES; do
+    local vm; vm="$(vm_name "$n")"
+    vsh destroy "$vm" >/dev/null 2>&1 || true
+    vsh undefine "$vm" --snapshots-metadata >/dev/null 2>&1 || true
+    vsh vol-delete --pool "$VM_POOL" "$n.qcow2" >/dev/null 2>&1 || true
+    vsh vol-delete --pool "$VM_POOL" "$n-seed.iso" >/dev/null 2>&1 || true
+    log "removed $vm"
+  done
+  rm -f "$STATE_DIR"/stage.* "$STATE_DIR/known_hosts"
+  if [[ "$yes" == "--yes" ]] || { read -rp "Also remove the two libvirt networks? [y/N]: " a; [[ "$a" == y ]]; }; then
+    for net in "$MGMT_NET" "$CLUSTER_NET"; do
+      vsh net-destroy "$net" >/dev/null 2>&1 || true
+      vsh net-undefine "$net" >/dev/null 2>&1 || true
+    done
+    rm -f "$STATE_DIR/stage.networks"
+  fi
+  cat <<EOF
+
+VMs removed (base image + host packages kept for fast rebuild: ./labctl up).
+Full host cleanup (optional, needs sudo):
+  sudo systemctl disable --now k8slab-expose.service
+  sudo sed -i '/# BEGIN K8SLAB/,/# END K8SLAB/d' /etc/hosts
+EOF
+}
+
+case "${1:-help}" in
+  up)            cmd_up ;;
+  status)        cmd_status ;;
+  start)         cmd_start ;;
+  stop)          cmd_stop ;;
+  restart)       cmd_stop; cmd_start ;;
+  ssh)           shift; n="${1:?usage: labctl ssh <node> [cmd]}"; shift || true; nssh "$n" "$@" ;;
+  console)       vsh console "$(vm_name "${2:?usage: labctl console <node>}")" ;;
+  ips)           cmd_ips ;;
+  autostart)     shift; cmd_autostart "$@" ;;
+  sniff)         shift; cmd_sniff "$@" ;;
+  snapshot)      shift; cmd_snapshot "$@" ;;
+  reset)         cmd_snapshot restore baseline ;;
+  etcd-backup)   cmd_etcd_backup ;;
+  kubeconfig)    cmd_kubeconfig ;;
+  approve-certs) approve_kubelet_csrs; kubectl get csr | tail -n +2 | sed 's/^/  /' ;;
+  expose)        shift; cmd_expose "$@" ;;
+  doctor)        cmd_doctor ;;
+  destroy)       shift || true; cmd_destroy "$@" ;;
+  help|--help|-h) usage ;;
+  *) usage; exit 1 ;;
+esac

@@ -1,0 +1,29 @@
+# ============================================================================
+# Postgres, "the best way" on k8s: the CloudNativePG operator.
+# 2 instances = primary + streaming-replica with automated failover; volumes
+# on Longhorn (which itself replicates) — data survives node death twice over.
+# The operator creates the `shop-db-app` secret (key `uri` = full DSN) and
+# the shop-db-rw / shop-db-ro services. Schema + seed via postInitApplicationSQL.
+# ============================================================================
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: shop-db
+  namespace: microshop
+spec:
+  instances: 2
+  storage:
+    size: 2Gi
+    storageClass: longhorn
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+  bootstrap:
+    initdb:
+      database: app
+      owner: app
+      postInitApplicationSQL:
+        - CREATE TABLE products (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name text NOT NULL, emoji text NOT NULL, price_cents bigint NOT NULL)
+        - CREATE TABLE orders (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, product_id bigint NOT NULL REFERENCES products(id), qty int NOT NULL, total_cents bigint NOT NULL, created_at timestamptz NOT NULL DEFAULT now())
+        - INSERT INTO products (name, emoji, price_cents) VALUES ('Rack Server', '🖥️', 249900), ('Managed Switch', '🔀', 89900), ('Patch Cable', '🔌', 900), ('42U Rack', '🗄️', 119900), ('UPS Battery', '🔋', 45900)
+        - ALTER TABLE products OWNER TO app
+        - ALTER TABLE orders OWNER TO app
